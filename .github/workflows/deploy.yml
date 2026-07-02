@@ -1,0 +1,148 @@
+name: Build, Push & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}   # allows manual "Run workflow" trigger too
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false   # never cancel a deploy mid-flight
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ai-deploy
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Copy the compose file + nginx configs to the server so infra changes
+      # (not just app code) also get deployed.
+      - name: Copy deployment files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          source: "docker-compose.yml,nginx/"
+          target: "~/ai-deploy"
+          strip_components: 0
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        # All config/secrets are forwarded from GitHub into the remote shell
+        # via `envs` below (no .env file lives on the server). docker compose
+        # reads them for variable substitution and injects the app-facing ones
+        # into the api container via its `environment:` block.
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+          APP_ENV: production
+          APP_VERSION: 0.1.0
+          LOG_LEVEL: INFO
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          # Names of the env vars above to forward into the remote script.
+          envs: IMAGE_TAG,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,APP_ENV,APP_VERSION,LOG_LEVEL
+          script: |
+            set -e
+            cd ~/ai-deploy
+
+            # --- Ensure Docker is installed (idempotent) ---
+            # Skips entirely if docker already exists; otherwise installs it
+            # (plus the compose plugin) via Docker's official convenience
+            # script. Requires passwordless sudo for the deploy user.
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "Docker not found — installing via get.docker.com ..."
+              curl -fsSL https://get.docker.com | sudo sh
+              sudo systemctl enable --now docker || true
+              # Allow the deploy user to run docker without sudo on FUTURE
+              # logins (group change doesn't apply to this session).
+              sudo usermod -aG docker "$USER" || true
+            fi
+
+            # The group change above isn't active in this session, so decide
+            # how to invoke docker right now: directly if the socket is
+            # reachable, otherwise fall back to sudo.
+            if docker info >/dev/null 2>&1; then
+              DOCKER="docker"
+            else
+              # Fresh install: the docker group isn't active in this session
+              # yet, so fall back to sudo. sudo resets the environment by
+              # default, which blanks out the compose substitution vars
+              # (POSTGRES_*, DOCKERHUB_USERNAME, IMAGE_TAG, ...); forward them
+              # explicitly with --preserve-env so `docker compose` sees them.
+              DOCKER="sudo --preserve-env=IMAGE_TAG,DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_DB,REDIS_PASSWORD,APP_ENV,APP_VERSION,LOG_LEVEL docker"
+            fi
+
+            echo "$DOCKERHUB_TOKEN" | $DOCKER login -u "$DOCKERHUB_USERNAME" --password-stdin
+
+            $DOCKER compose pull api
+            # Rolling restart: recreate ONLY the api container from the image
+            # we just pulled. Do NOT use --build here: the server only has
+            # docker-compose.yml + nginx/ (see the scp step above), not the
+            # Dockerfile or app/ source, and the image is already built and
+            # pushed by the build-and-push job. Building here would either fail
+            # (no context) or silently deploy stale code from an old clone.
+            $DOCKER compose up -d --no-deps api
+            # Ensure the supporting services exist (no-op if already running).
+            $DOCKER compose up -d postgres redis nginx
+            # Recreating api gives it a new container IP. NGINX resolves the
+            # "api" upstream once at startup and caches it, so it would keep
+            # proxying to the dead old IP (502s) until reloaded. A reload
+            # re-resolves the name with zero downtime; fall back to recreating
+            # nginx if the reload can't run (e.g. first deploy).
+            $DOCKER compose exec -T nginx nginx -s reload \
+              || $DOCKER compose up -d --force-recreate --no-deps nginx
+
+            # Wait for health check to pass before declaring success
+            for i in $(seq 1 10); do
+              if curl -fsS http://localhost/health; then
+                echo "Health check passed"
+                break
+              fi
+              echo "Waiting for app to become healthy... ($i/10)"
+              sleep 3
+            done
+
+            $DOCKER image prune -f
