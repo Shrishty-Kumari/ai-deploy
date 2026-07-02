@@ -1,0 +1,57 @@
+# ---------------------------------------------------------------------------
+# SSL-ENABLED CONFIG — use this once you own a domain and have run certbot.
+# Rename this file to default.conf (replacing the HTTP-only one) after
+# certificates exist at /etc/letsencrypt/live/YOUR_DOMAIN/.
+# See docs/DEPLOYMENT.md "SSL setup" for the exact commands.
+# ---------------------------------------------------------------------------
+
+server {
+    listen 80;
+    server_name YOUR_DOMAIN.com www.YOUR_DOMAIN.com;
+
+    # Required for certbot to renew certs
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # Redirect everything else to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name YOUR_DOMAIN.com www.YOUR_DOMAIN.com;
+
+    ssl_certificate     /etc/letsencrypt/live/YOUR_DOMAIN.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/YOUR_DOMAIN.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+
+    location /health {
+        proxy_pass http://api:8000/health;
+        proxy_set_header Host $host;
+        access_log off;
+    }
+
+    location / {
+        limit_req zone=api_limit burst=20 nodelay;
+
+        proxy_pass http://api:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+}
